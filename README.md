@@ -26,6 +26,8 @@ https://clientconfig.rpg.riotgames.com/api/v1/config/public?namespace=keystone.p
 | 只釘 `secure` 網域，bundle 仍走 CloudFront | ~0.04 MB/s |
 | 兩個網域都釘到快的節點 | ~7 MB/s |
 
+2026-11-14 再測一次：同一個 bundle、前 8 MB，CloudFront 節點（`65.9.180.x`）0.16～0.32 MB/s，`175.99.116.58` 約 13 MB/s。
+
 ## 其他觀察
 
 - **冷熱快取差很多**：同一個節點，檔案不在快取（cache miss）時首位元組約 1.5 秒、約 1.5 MB/s；在快取時約 7 MB/s。對 bundle 發一個 1 byte 的 range 請求，就會把整個 bundle 拉進節點快取。
@@ -45,13 +47,15 @@ https://clientconfig.rpg.riotgames.com/api/v1/config/public?namespace=keystone.p
 ```
 
 - 候選節點來自多個公共 DNS 的查詢結果，加上曾經測到很快的節點與上次選中的節點（存在 `last_best.txt`）。
-- 用 `curl --resolve` 強制連到各節點測速，憑證驗證失敗或回應不是 200 的節點一律淘汰。
+- **用真的遊戲檔 bundle 測速**：從本機已安裝版本的 manifest 讀出 bundle 清單，每次隨機挑一個，在 bundle 網域（`lol.dyn.riotcdn.net`）上用 `curl --resolve` 強制連到各節點，抓前 8 MB 計速。所有節點測同一個 bundle；隨機挑是為了避免一直測到被自己測熱的那個。
+- 同一個節點也會對 `secure` 網域發 1 byte 請求，確認兩個網域都能用（兩個都會釘到它）。憑證驗證失敗或回應不對的節點一律淘汰。
+- 讀 bundle 清單要 **Python + zstd**（manifest 是 zstd 壓縮的，Windows 沒有內建解壓）：Python 3.14 以上直接可用，舊版要 `pip install zstandard`。`rman_bundles.py` 要跟腳本放在同一個資料夾。沒有的話會退回用 manifest 測並顯示警告。
 - 寫入的設定包在 `# RIOT-CDN-FIX BEGIN/END` 之間，`-Remove` 會整段移除。
 - **更新完記得 `-Remove`**：Riot 之後換節點時，留著舊的 hosts 會讓更新失敗。
 
 ## 已知限制
 
-- 腳本目前用**本機的 manifest** 當測速檔，依上面「測速要用真的 bundle」的觀察，測出來的速度可能偏樂觀。
+- bundle 清單來自**本機已安裝的版本**。Riot 剛出新版、你還沒更新時，新版的 bundle 可能比測到的冷（不在節點快取），實際速度會比測速低一些。
 - 內建的快節點 IP（`175.99.116.x`）是在台灣測到的，其他地區不一定適用，要以測速結果為準。
 - 只處理英雄聯盟和聯盟戰棋。
 

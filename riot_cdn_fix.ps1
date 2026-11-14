@@ -46,17 +46,43 @@ function Write-Hosts($lines) {
     ipconfig /flushdns | Out-Null
 }
 
-# 用本機已安裝版本的 manifest 當測速檔（版本換了也能用）
-# RMAN 檔頭第 16 byte 起的 8 bytes（little-endian）就是 manifest ID
-function Get-TestPath($domain) {
+# 測速檔：用真的遊戲檔 bundle，在 bundle 網域（X.dyn.riotcdn.net）上測
+# manifest 幾乎都常駐節點快取，拿它測每個節點都很快，看不出真正下載會走多慢
+# bundle 清單從本機已安裝版本的 manifest 讀（需要 Python + zstd，見 rman_bundles.py）
+# 每次隨機挑一個 bundle，所有節點測同一個；避免一直測同一個已被自己測熱的 bundle
+$BundleHelper = Join-Path $PSScriptRoot 'rman_bundles.py'
+$TestBytes = 8MB
+
+function Get-ManifestFile($domain) {
     $product = ($domain -split '\.')[0] -replace '^lol$', 'league_of_legends'
     $f = "$env:ProgramData\Riot Games\Metadata\$product.live\$product.live.manifest"
-    if (-not (Test-Path $f)) { return $null }
+    if (Test-Path $f) { return $f } else { return $null }
+}
+
+# RMAN 檔頭第 16 byte 起的 8 bytes（little-endian）就是 manifest ID
+function Get-ManifestPath($file) {
     $bytes = New-Object byte[] 24
-    $s = [IO.File]::OpenRead($f); [void]$s.Read($bytes, 0, 24); $s.Close()
+    $s = [IO.File]::OpenRead($file); [void]$s.Read($bytes, 0, 24); $s.Close()
     if ([Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'RMAN') { return $null }
     $id = [BitConverter]::ToUInt64($bytes, 16).ToString('X16')
     return "/channels/public/releases/$id.manifest"
+}
+
+# 回傳 @{ Host; Path; Kind }；拿不到 bundle 就退回用 manifest（並標示 Kind = manifest）
+function Get-TestTarget($domain) {
+    $file = Get-ManifestFile $domain
+    if (-not $file) { return $null }
+    $py = Get-Command python -ErrorAction SilentlyContinue
+    if ($py -and (Test-Path $BundleHelper)) {
+        $lines = & $py.Source -I $BundleHelper $file 50 2>$null
+        if ($LASTEXITCODE -eq 0 -and $lines) {
+            $id = (($lines | Get-Random) -split ' ')[0]
+            return @{ Host = ($domain -replace '\.secure\.dyn\.', '.dyn.'); Path = "/channels/public/bundles/$id.bundle"; Kind = 'bundle' }
+        }
+    }
+    $path = Get-ManifestPath $file
+    if (-not $path) { return $null }
+    return @{ Host = $domain; Path = $path; Kind = 'manifest' }
 }
 
 # 回傳兩組：先測的快節點，和 DNS 查到的其他節點
@@ -81,12 +107,18 @@ function Get-CandidateIps($domain) {
     return @($first) + @($ips | Where-Object { $first -notcontains $_ })
 }
 
-# 用 curl --resolve 強制連到該 IP；憑證驗證失敗或非 200 一律淘汰
-# 慢節點最多等 8 秒就放棄，用已下載的量算速度
-function Measure-Ip($domain, $ip, $path) {
-    $r = & curl.exe -s -o NUL --resolve "${domain}:443:$ip" -w '%{http_code} %{size_download} %{time_total}' --max-time 8 "https://$domain$path" 2>$null
+# 用 curl --resolve 強制連到該 IP；憑證驗證失敗或回應不對一律淘汰
+# 只抓前 8MB（range 請求，回 206）；慢節點最多等 8 秒就放棄，用已下載的量算速度
+# 兩個網域都會釘到同一個 IP，所以 manifest 網域也要能連（只抓 1 byte 確認憑證和回應）
+function Measure-Ip($domain, $ip, $target, $manifestPath) {
+    if ($target.Kind -eq 'bundle' -and $manifestPath) {
+        $c = & curl.exe -s -o NUL -r 0-0 --resolve "${domain}:443:$ip" -w '%{http_code}' --max-time 5 "https://$domain$manifestPath" 2>$null
+        if ("$c" -notin @('200', '206')) { return 0 }
+    }
+    $h = $target.Host
+    $r = & curl.exe -s -o NUL -r "0-$($TestBytes - 1)" --resolve "${h}:443:$ip" -w '%{http_code} %{size_download} %{time_total}' --max-time 8 "https://$h$($target.Path)" 2>$null
     $code, $size, $time = "$r" -split ' '
-    if ($code -ne '200' -or [double]$time -le 0) { return 0 }
+    if ($code -notin @('200', '206') -or [double]$time -le 0) { return 0 }
     return [double]$size / [double]$time / 1MB
 }
 
@@ -104,12 +136,16 @@ if (-not $TestOnly -and -not (Test-Admin)) {
 $best = @{}
 foreach ($domain in $Domains) {
     Write-Host "== $domain"
-    $path = Get-TestPath $domain
-    if (-not $path) { Write-Host "  找不到測速檔（先開一次 Riot Client 再跑），跳過`n" -ForegroundColor Yellow; continue }
-    Write-Host "  測速檔：$path"
+    $target = Get-TestTarget $domain
+    if (-not $target) { Write-Host "  找不到測速檔（先開一次 Riot Client 再跑），跳過`n" -ForegroundColor Yellow; continue }
+    $manifestPath = Get-ManifestPath (Get-ManifestFile $domain)
+    Write-Host "  測速檔：https://$($target.Host)$($target.Path)"
+    if ($target.Kind -ne 'bundle') {
+        Write-Host '  （讀不到 bundle 清單，退回用 manifest 測；manifest 常駐快取，速度會偏樂觀。要用 bundle 測請裝 Python 與 zstandard）' -ForegroundColor Yellow
+    }
     $results = New-Object System.Collections.Generic.List[object]
     foreach ($ip in (Get-CandidateIps $domain)) {
-        $mb = Measure-Ip $domain $ip $path
+        $mb = Measure-Ip $domain $ip $target $manifestPath
         Write-Host ("  {0,-16} {1}" -f $ip, $(if ($mb -gt 0) { '{0:N2} MB/s' -f $mb } else { '失敗/不可用' }))
         $results.Add([pscustomobject]@{ Ip = $ip; MBs = $mb })
         if ($mb -ge $GoodEnoughMBs) { Write-Host "  （已達 $GoodEnoughMBs MB/s，其他節點不測了）"; break }
